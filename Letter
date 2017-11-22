@@ -1,0 +1,1111 @@
+USE [GatewayINSPIRE]
+GO
+/****** Object:  StoredProcedure [dbo].[usp_Letters_Trigger_ForEvent_Common]    Script Date: 11/22/2017 3:54:03 PM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+-- ========================================================================================================
+-- 03/13/2015 CRD-4860 - Add Middle Initial - Code Review 
+-- Merge From StickyTeam Branch
+-- ========================================================================================================      
+-- Author:  Renjith Padmanabhan    
+-- Create date: 01/21/2009
+-- Description: Stored procedure that will trigger of letters for an event   
+-- Modified by : Bindiya Pradhan
+-- Modified on : 9/7/2011
+-- Modification: While saving Involuntary Disenrollment page, Letter was not generated due to which validation is firing 
+--               for all the letters in Letter_Data_Outgoing_Daily table(which is business requirement for RealTimeMLEValidation page) 
+--               This caused timeout issue in THP staging.To avoid MLE validation when Letter is not generated. We are adding new condition (discussed with Renjith and Manu). 
+--
+-- Modified by : Andrés García
+-- Modified on : 08/15/2014
+-- Modification: According to DEV-396, to check letter procs on Performance and cleaning
+-- ===========================================================================================================
+
+/* TEST DATA
+Exec [usp_Letters_Trigger_ForEvent_Common] 'EVT_ENR_ACK',0,22277 ,'','Disenrolltype=Invol,ReasonCode=024',0,6
+Exec [usp_Letters_Trigger_ForEvent_Common] 'EVT_ENR_ACK',0,22277 ,'','X_Disenrolltype=Invol,ReasonCode=024',0,6
+Exec [usp_Letters_Trigger_ForEvent_Common] 'EVT_ENR_ACK',0,22277 ,'','',0,6
+
+Exec [usp_Letters_Trigger_ForEvent_Common] 'TRC_ENR_REJD',527,27132 
+
+Exec [usp_Letters_Trigger_ForEvent_Common] 'EVT_ENR_ACK',234,22273
+Exec [usp_Letters_Trigger_ForEvent_Common] 'EVT_ENR_ACK',219,22273
+Exec [usp_Letters_Trigger_ForEvent_Common] 'EVT_ENR_ACK',238,22275 
+Exec [usp_Letters_Trigger_ForEvent_Common] 'EVT_ENR_ACK',230,22269 
+
+select * from user_details
+*/  
+ALTER  PROCEDURE [dbo].[usp_Letters_Trigger_ForEvent_Common]
+    @pTrigger VARCHAR(50),
+    @pAppID INT,
+    @pMemberID INT,
+    @pTRCCode VARCHAR(50) = '000',
+    @pAdditionalParameters VARCHAR(1000) = '',
+    @pManualOverride BIT = 0,
+    @pUserId INT = 6,
+    @pLetterId INT = 0 OUTPUT,
+    @pContractNumber VARCHAR(25) = NULL,
+    @pPBP VARCHAR(25) = NULL,
+    @pGroupNumber VARCHAR(25) = NULL,
+    @pEffectiveDate VARCHAR(25) = NULL,
+    @TemplateID INT = 0,
+    @SkipLetterDelete INT = 0,
+    @pPopulateAddress varchar(20) = ''
+AS 
+    BEGIN 
+
+		-------------------------------------------------------------------
+		-- DEV-396: Check letter procs
+
+		DECLARE 
+			@EnrDetEnroll_MemberID INT,
+			@EnrDetElectionType VARCHAR(300),
+			@EnrDetLetterRequestInformation_Full VARCHAR(1000),
+			@EnrDetLetterRequestInformation VARCHAR(1000),
+			@AppVarClient VARCHAR(200),
+			@MapEnrMemLet_LetterTemplateID INT, 
+			@MapEnrMemLet_Enroll_AppID INT,
+			@MapEnrMemLet_Enroll_MemberID INT, 
+			@MapEnrMemLet_LetterGenerated BIT,
+			@MapEnrMemLet_status CHAR(1),
+			@MapEnrMemLet_LetterID INT,
+			@MapEnrMemLet_DueDate VARCHAR(10),
+			@LetMas_LetterMasterID VARCHAR(MAX)
+			
+		SELECT
+			@EnrDetEnroll_MemberID = 0,
+			@EnrDetElectionType = '',
+			@EnrDetLetterRequestInformation_Full = '',
+			@EnrDetLetterRequestInformation = '',
+			@AppVarClient = '',
+			@MapEnrMemLet_LetterTemplateID = 0, 
+			@MapEnrMemLet_Enroll_AppID = 0,
+			@MapEnrMemLet_Enroll_MemberID = 0, 
+			@MapEnrMemLet_LetterGenerated = 0,
+			@MapEnrMemLet_status = '',
+			@MapEnrMemLet_LetterID = 0,
+			@MapEnrMemLet_DueDate = '',
+			@LetMas_LetterMasterID = ''
+		    
+			SELECT  @EnrDetEnroll_MemberID = Enroll_MemberID,
+					@EnrDetElectionType = ElectionType,
+					@EnrDetLetterRequestInformation_Full = LetterRequestInformation_Full,
+					@EnrDetLetterRequestInformation = LetterRequestInformation
+			FROM    Enrollment_Details ( NOLOCK )
+			WHERE   Enroll_AppID = @pAppID
+		    
+		    
+			SELECT  @AppVarClient = LTRIM(RTRIM(ISNULL(Variablevalue, '')))
+			FROM    Application_Variables ( NOLOCK )
+			WHERE   VariableName = 'HealthPlanName'
+			
+			SELECT  TOP 1 
+					@MapEnrMemLet_LetterTemplateID = LetterTemplateID,
+					@MapEnrMemLet_Enroll_AppID = Enroll_AppID,
+					@MapEnrMemLet_Enroll_MemberID = Enroll_MemberID,
+					@MapEnrMemLet_LetterGenerated = lettergenerated,
+					@MapEnrMemLet_status = status, 
+					@MapEnrMemLet_LetterID = LetterID,
+					@MapEnrMemLet_DueDate = DueDate
+			FROM    MapEnrollMembertoLetters (NOLOCK)
+			WHERE   Enroll_AppID = @pAppID
+					AND Enroll_MemberID = @pMemberID
+
+
+			--SELECT  @LetMas_LetterMasterID =  COALESCE(@LetMas_LetterMasterID+',' ,'') + LetterMasterID
+			--FROM    letter_master (NOLOCK)
+			--WHERE   IKALetterMasterCode IN ( 'ENRRFI', 'DISENRRFI' )
+			
+
+			IF ( OBJECT_ID('tempdb..#TmpLetterTemplates') IS NOT NULL ) 
+				DROP TABLE #TmpLetterTemplates
+		        
+			SELECT  LetterTemplateID INTO #TmpLetterTemplates
+			FROM    Letter_Templates (NOLOCK)
+			WHERE   LetterMasterId IN (SELECT LetterMasterID
+			FROM    letter_master (NOLOCK)
+			WHERE   IKALetterMasterCode IN ( 'ENRRFI', 'DISENRRFI' ) )
+			
+		
+		       
+		            
+		-------------------------------------------------------------------
+    
+        DECLARE @LogUID UNIQUEIDENTIFIER = NEWID()
+        EXEC usp_InsertAuditLog 'MapEnrollMembertoLetters', 0, @LogUID, @pUserId,
+            @pMemberID, @pAppID, @pLetterId, 0, 0
+
+
+        DECLARE @LetterHistId INT,
+            @commandString VARCHAR(1000),
+            @LetterErrors VARCHAR(2000),
+            @sqlLetter VARCHAR(MAX),
+            @fields VARCHAR(4000),
+            @Client VARCHAR(100),
+            @SkipLetterProcessing bit
+                        
+        SET @fields = ''
+      		
+		SELECT  @Client = @AppVarClient
+        
+        
+        IF OBJECT_ID('Letter_Trgger_History_Log') IS NULL 
+            CREATE TABLE Letter_Trgger_History_Log
+                (
+                  LetterTriggerHistoryID INT IDENTITY(1, 1),
+                  ProcessTime DATETIME,
+                  TriggerName VARCHAR(100),
+                  Enroll_appid INT,
+                  Enroll_memberid INT,
+                  TRCCode VARCHAR(100),
+                  AdditionalParameters VARCHAR(1000),
+                  ManualOverride BIT,
+                  UserId INT,
+                  ContractNumber VARCHAR(100),
+                  pbp VARCHAR(100),
+                  GroupNumber VARCHAR(100),
+                  EffectiveDate VARCHAR(100),
+                  TemplateID VARCHAR(100),
+                  OutputLetterId INT,
+                  SelectedTemplateId VARCHAR(100),
+                  ExistingLetters VARCHAR(1000),
+                  CommandString VARCHAR(1000)
+                )
+
+
+        IF NOT EXISTS ( SELECT  column_name
+                        FROM    information_schema.columns ( NOLOCK )
+                        WHERE   table_name = 'Letter_Trgger_History_Log'
+                                AND column_name = 'ProcessLog' ) 
+            BEGIN 
+                ALTER TABLE Letter_Trgger_History_Log
+                ADD ProcessLog VARCHAR(4000)
+            END
+			
+        DECLARE @commandStringFromInout VARCHAR(1000)
+
+        SET @commandStringFromInout = 'exec [dbo].[usp_Letters_Trigger_ForEvent_Common] '
+            + '''' + CAST(ISNULL(@pTrigger, '') AS VARCHAR) + '''' + ' ,'
+            + '''' + CAST(ISNULL(@pAppID, '') AS VARCHAR) + '''' + ' ,' + ''''
+            + CAST(ISNULL(@pMemberID, '') AS VARCHAR) + '''' + ' ,' + ''''
+            + CAST(ISNULL(@pTRCCode, '') AS VARCHAR) + '''' + ' ,' + ''''
+            + CAST(ISNULL(@pAdditionalParameters, '') AS VARCHAR) + ''''
+            + ' ,' + '''' + CAST(ISNULL(@pManualOverride, '') AS VARCHAR)
+            + '''' + ' ,' + '''' + CAST(ISNULL(@pUserId, '') AS VARCHAR)
+            + '''' + ' ,' + '''' + CAST(ISNULL(@pLetterId, '') AS VARCHAR)
+            + '''' + ' ,' + ''''
+            + CAST(ISNULL(@pContractNumber, '') AS VARCHAR) + '''' + ' ,'
+            + '''' + CAST(ISNULL(@pPBP, '') AS VARCHAR) + '''' + ' ,' + ''''
+            + CAST(ISNULL(@pGroupNumber, '') AS VARCHAR) + '''' + ' ,' + ''''
+            + CAST(ISNULL(@pEffectiveDate, '') AS VARCHAR) + '''' + ' ,'
+            + '''' + CAST(ISNULL(@TemplateID, '') AS VARCHAR) + '''' + ' ,'
+            + '''' + CAST(ISNULL(@SkipLetterDelete, '') AS VARCHAR) + ''''
+
+
+        INSERT  INTO Letter_Trgger_History_Log with (rowlock)
+                SELECT  GETDATE(),
+                        @pTrigger,
+                        @pAppID,
+                        @pMemberID,
+                        @pTRCCode,
+                        @pAdditionalParameters,
+                        @pManualOverride,
+                        @pUserId,
+                        @pContractNumber,
+                        @pPBP,
+                        @pGroupNumber,
+                        @pEffectiveDate,
+                        @TemplateID,
+                        0,
+                        '',
+                        '',
+                        @commandStringFromInout,
+                        ''
+
+        SET @LetterHistId = SCOPE_IDENTITY()
+        
+            --Don't make memebrship for if planCategory=1 and no letter triggered , CR 734'
+
+        
+		IF EXISTS ( SELECT TOP 1
+							1
+					FROM    dbo.Enrollment_Details ED ( NOLOCK )
+							INNER JOIN dbo.view_AllPlans vw ON vw.planid = ed.planid
+					WHERE   ed.Enroll_AppID = @pAppID
+							AND PlanCategory = 1 ) 
+			BEGIN
+				RETURN ;
+			END 
+
+        IF ( OBJECT_ID('tempdb..#TmpLetterDaily') IS NOT NULL ) 
+            DROP TABLE #TmpLetterDaily
+                    
+        CREATE TABLE [dbo].[#TmpLetterDaily]
+            (
+              Enroll_appid INT,
+              Enroll_MemberID INT,
+              LetterTemplateId INT,
+              [LetterCode] VARCHAR(50),
+              [PBPNumber] VARCHAR(3),
+              [ContractNumber] VARCHAR(5),
+              [FileCreationDate] VARCHAR(10),
+              [MemberFirstName] VARCHAR(30),
+              [MemberMiddleInitial] VARCHAR(1),
+              [MemberLastName] VARCHAR(40),
+              [Salutation] VARCHAR(5),
+              [MemberorPOAAddressLine1] VARCHAR(100),
+              [MemberorPOAAddressLine2] VARCHAR(100),
+              [MemberorPOAAddressLine3] VARCHAR(100),
+              [MemberorPOACity] VARCHAR(50),
+              [MemberorPOAState] VARCHAR(2),
+              [MemberorPOAZipCode] VARCHAR(10),
+              [MemberID] VARCHAR(15),
+              [HICN] VARCHAR(12),
+              [RxID] VARCHAR(20),
+              [RxGroup] VARCHAR(15),
+              [RxBin] VARCHAR(6),
+              [RxPCN] VARCHAR(10),
+              [PlanName] VARCHAR(100),
+              [PlanType] VARCHAR(4),
+              [PlanStartDate] VARCHAR(8),
+              [PlanEndDate] VARCHAR(8),
+              [NewPlanName] VARCHAR(100),
+              [NewContractNumber] VARCHAR(5),
+              [NewPBPNumber] VARCHAR(3),
+              [NewPlanStartDate] VARCHAR(8),
+              [NewPlanEndDate] VARCHAR(8),
+              [EffectiveDate] VARCHAR(8),
+              [DisenrollmentEffectiveDate] VARCHAR(8),
+              [LastDateofCoverage] VARCHAR(10),
+              [PremiumAmount] VARCHAR(8),
+              [NewPremiumAmount] VARCHAR(8),
+              [LISIndicator] VARCHAR(1),
+              [LISLevel] VARCHAR(3),
+              [LISSubsidyLevel] VARCHAR(3),
+              [LISMonthlyPremium] VARCHAR(8),
+              [LISDeductibleAmount] VARCHAR(8),
+              [LISCoPayAmount] VARCHAR(8),
+              [LEPIndicator] VARCHAR(1),
+              [LEPAmount] VARCHAR(8),
+              [NoofUncoveredMonths] VARCHAR(3),
+              [RequestedDate] VARCHAR(8),
+              [DeadlineDate] VARCHAR(8),
+              [ReasonCode] VARCHAR(60),
+              [PreviousEnrollmentIndicator] VARCHAR(1),
+              [FirstMonthofNewIEP] VARCHAR(8),
+              [LastMonthofNewIEP] VARCHAR(8),
+              [CreditableCoverageGapStartDate] VARCHAR(8),
+              [CreditableCoverageGapEndDate] VARCHAR(8),
+              [RetroactiveLEPPaymentIndicator] VARCHAR(1),
+              [RetroactiveLumpSum] VARCHAR(8),
+              [RetroactiveLEPAmountOwed] VARCHAR(8),
+              [RefundMethodIndicator] VARCHAR(1),
+              [LEPRefundAmount] VARCHAR(8),
+              [PremiumPaymentMethodIndicator] VARCHAR(1),
+              [ErrorReason] VARCHAR(1),
+              [LEPAmountChangeIndicator] VARCHAR(1),
+              [EmployerGroupIndicator] VARCHAR(1),
+              [EmployerUnionSPAPName] VARCHAR(100),
+              [EffectiveDateofLISEligibility] VARCHAR(8),
+              [State] VARCHAR(50),
+              [County] VARCHAR(50),
+              [RegionCode] VARCHAR(10),
+              [GroupNumber] VARCHAR(25),
+              [Miscellaneous] VARCHAR(50),
+              [CatastrophicCoverageCoPay_Generic_Preferred] VARCHAR(150),
+              [CatastrophicCoverageCoPay_AllOtherDrugs] VARCHAR(150),
+              [MemberStatus] VARCHAR(50),
+              [AttestationType] VARCHAR(50),
+              [DateAttestationReturned] VARCHAR(50),
+              EndDateDeemedContinuedEligibility VARCHAR(50),
+              PeriodLengthDeemedContinuedEligibility VARCHAR(7),
+              ExpirationDateofDeemedContEligSEPPeriod VARCHAR(8),
+              LISDrugCoPay_GenericPreferred VARCHAR(100),
+              LISDrugCoPay_AllOtherDrugs VARCHAR(100),
+              [IKALetterRequestID] VARCHAR(20),
+              [Language] VARCHAR(3),
+              TRC VARCHAR(20),
+              PCPID VARCHAR(20),
+              LetterGenerationMethodIndicator VARCHAR(1),
+              LowIncomeSubsidySourceIndicator VARCHAR(1),
+              FavorableIndicator VARCHAR(1),
+              EntitlementIndicator VARCHAR(1),
+              PremiumDueDate VARCHAR(8),
+              PastDueBalance VARCHAR(8),
+              EndDateofLISEligibility VARCHAR(8),
+              AttestationReturneeIndicator VARCHAR(1),
+              LEPNoticeIndicator VARCHAR(1),
+              LateCreditableInfoIndicator VARCHAR(1),
+              SubGroup VARCHAR(20),
+              FlagReason VARCHAR(1000),
+              FlagFields VARCHAR(250),
+              Flag BIT,
+              --GAT_900201
+             [LetterGenerationDate] [varchar](8),
+			 [CostSharingIndicator] [varchar](1),
+			 [ShipName] [varchar](150), 
+			 [ShipNumber] [varchar](15),
+			 [AltFormat] VARCHAR(25)
+			 
+			--End of GAT_900201
+            ) 
+
+   -----Declare and Initialise variables
+        DECLARE @availabeLetters VARCHAR(250)
+        SET @availabeLetters = ''
+        SET @pLetterId = 0
+       
+        IF ( @pAppID IS NULL ) 
+            SET @pAppID = 0
+        IF ( @pMemberID IS NULL ) 
+            SET @pMemberID = 0
+		
+        DECLARE @healthPlanName VARCHAR(100)
+		SELECT  @healthPlanName = @AppVarClient
+	
+		
+        IF ISNULL(@pAppID, 0) > 0 
+			SET @pMemberID = @EnrDetEnroll_MemberID
+
+        IF ISNULL(@TemplateID, 0) > 0 
+            SET @availabeLetters = '( ' + CAST(@TemplateID AS VARCHAR(250)) + ' )'
+            
+        ELSE 
+            BEGIN
+           
+                BEGIN TRY
+                    EXEC [dbo].[usp_Letter_GetTemplateByTrigger] @pTrigger,
+                        @pAppID, @pMemberID, @availabeLetters OUTPUT,
+                        @pAdditionalParameters, @pManualOverride,
+                        @pContractNumber, @pPBP, @pGroupNumber,
+                        @pEffectiveDate, @pTRCCode
+                END TRY
+                BEGIN CATCH
+                
+                    SET @LetterErrors = ISNULL(@LetterErrors, '')
+                        + 'Error in picking letter template  : Error Message - '
+                        + ERROR_MESSAGE()
+                    UPDATE  Letter_Trgger_History_Log WITH ( ROWLOCK )
+                    SET     ProcessLog = @LetterErrors,
+                            SelectedTemplateId = NULL
+                    WHERE   LetterTriggerHistoryID = @LetterHistId 
+                    RETURN ;
+                END CATCH
+            END
+		
+
+        IF @availabeLetters <> ''
+            AND LEN(RTRIM(REPLACE(REPLACE(REPLACE(@availabeLetters, '(', ''),
+                                          ')', ''), ',', ''))) > 0 
+            BEGIN
+			----Get data for the templates and populate the letter history table
+                DECLARE @letterId INT,
+                    @sql NVARCHAR(250),
+                    @lettervalues INT
+                SELECT  @lettervalues = 0,
+                        @letterId = 0
+
+		               
+                
+                SET @sql = 'SELECT @letterId =  LetterTemplateID FROM dbo.Letter_Templates (nolock) where LetterTemplateID in '
+                    + @availabeLetters 
+                EXEC sp_executesql @sql, N'@letterId int OUTPUT',
+                    @letterId OUTPUT
+                
+                     BEGIN 
+
+                    UPDATE  Letter_Trgger_History_Log WITH ( ROWLOCK )
+                    SET     SelectedTemplateId = @letterId
+                    WHERE   LetterTriggerHistoryID = @LetterHistId 
+						
+						
+					
+                             
+                    DECLARE @letterOutputData XML
+					-- Generate xml output content
+                    BEGIN TRY
+                              
+                              if ( @pTrigger  ='EVT_TRR_LOSS_LIS' )
+                                begin               
+                        EXEC usp_LetterGenerateXMLbyID_Common @pLetterTemplateID = @letterId,
+                            @pEnrollAppID = @pAppID, @TRC = @pTRCCode,
+                            @pEnrollMemberID = @pMemberID,
+                            @pAdditionalParams ='AnnualLossofLISFile',
+                            @pContractNumber = @pContractNumber, @pPBP = @pPBP,
+                            @pGroupNumber = @pGroupNumber,
+                            @pEffectiveDate = @pEffectiveDate,
+                            @pPopulateAddress = @pPopulateAddress
+                            end
+                            else
+                             EXEC usp_LetterGenerateXMLbyID_Common @pLetterTemplateID = @letterId,
+                            @pEnrollAppID = @pAppID, @TRC = @pTRCCode,
+                            @pEnrollMemberID = @pMemberID,
+                            @pAdditionalParams = @pAdditionalParameters,
+                            @pContractNumber = @pContractNumber, @pPBP = @pPBP,
+                            @pGroupNumber = @pGroupNumber,
+                            @pEffectiveDate = @pEffectiveDate,
+                            @pPopulateAddress = @pPopulateAddress
+                       
+                    END TRY
+                    BEGIN CATCH
+                
+                        SET @LetterErrors = ISNULL(@LetterErrors, '')
+                            + 'Error in populating letter fields  : Error Message - '
+                            + ERROR_MESSAGE()
+                        UPDATE  Letter_Trgger_History_Log WITH ( ROWLOCK )
+                        SET     ProcessLog = @LetterErrors
+                        WHERE   LetterTriggerHistoryID = @LetterHistId 
+                        RETURN ;
+                    END CATCH
+                
+    
+                    DECLARE @CreatedBy INT
+                    SET @CreatedBy = @pUserId
+                    DECLARE @deadlineDate VARCHAR(50)
+                    
+                    IF @pAppID <> 0 
+                        SET @deadlineDate = CONVERT(VARCHAR, ( dbo.letter_GetDeadlineDate(@EnrDetElectionType, GETDATE(), @pAppID) ), 101)
+                    ELSE 
+                        BEGIN
+                            DECLARE @DaysToDeadline INT
+                            
+                            SELECT  @DaysToDeadline = ISNULL(DaysToDeadline, 30)
+                            FROM    letter_master mas ( NOLOCK ),
+                                    letter_templates tem ( NOLOCK )
+                            WHERE   LetterTemplateID = @letterId
+                                    AND tem.lettermasterid = mas.lettermasterid
+	                        
+                            SET @deadlineDate = CONVERT(VARCHAR, DATEADD(dd, @DaysToDeadline, GETDATE()), 101) 
+                                
+                        END
+					
+					
+                    DECLARE @deadlinedateinletter VARCHAR(50)
+                    SELECT  @deadlinedateinletter = ISNULL(DeadlineDate, '')
+                    FROM    #TmpLetterDaily 
+					
+					
+                    IF ( ISNULL(@deadlinedateinletter, '') <> '' ) 
+                            SELECT  @deadlineDate = @deadlinedateinletter
+				                 
+
+                    DECLARE @DuplicateSQL VARCHAR(2000)
+                    DECLARE @dupeletterIds VARCHAR(250)
+                    SELECT  @dupeletterIds = DuplicateLetters
+                    FROM    letter_templates (NOLOCK)
+                    WHERE   LetterTemplateID = @letterId
+                    SET @dupeletterIds = '(' + @dupeletterIds + ')'
+					
+                    IF LEN(@dupeletterIds) > 2 
+                        BEGIN
+                            SET @DuplicateSQL = 'Update MapEnrollMembertoLetters with (rowlock) set Status=''D'' where LetterTemplateID in (SELECT [LetterTemplateID] FROM letter_templates (nolock) WHERE [LetterMasterId]IN '
+                                + @dupeletterIds + ') and Enroll_AppID= '
+                                + CONVERT(VARCHAR, @pAppID)
+                                + ' and Enroll_MemberID = '
+                                + CONVERT(VARCHAR, @pMemberID)
+                                + ' and LetterGenerated = 0 and status =''A'' '
+                            EXEC ( @DuplicateSQL )
+                        END
+                    DECLARE @SkipLetter BIT
+                    SET @SkipLetter = 0
+					
+                    IF @pManualOverride <> 1 
+                        BEGIN
+					        ---Set user to system user
+                            SET @CreatedBy = 1
+                            IF @pAppID <> 0 
+                                BEGIN
+                                    
+                                    IF ( @MapEnrMemLet_LetterTemplateID = @letterId 
+										AND @MapEnrMemLet_Enroll_AppID = @pAppID
+										AND @MapEnrMemLet_Enroll_MemberID = @pMemberID
+										AND @MapEnrMemLet_LetterGenerated = 1 ) 
+	
+                                        BEGIN
+    							
+                                            IF EXISTS ( SELECT	TOP 1  1
+														FROM    Letter_data_outgoing_archive (nolock) L,
+																#TmpLetterDaily D ( NOLOCK )
+														WHERE   L.Lettertemplateid = @MapEnrMemLet_LetterTemplateID
+																AND D.Lettertemplateid = L.Lettertemplateid
+																AND @MapEnrMemLet_LetterTemplateID = @letterId
+																AND ISNULL(@MapEnrMemLet_Enroll_AppID,0) = ISNULL(D.Enroll_appid,0)
+																AND ISNULL(L.Enroll_AppID,0) = ISNULL(D.Enroll_appid,0)
+																AND @MapEnrMemLet_Enroll_MemberID = D.Enroll_MemberID
+																AND @MapEnrMemLet_LetterGenerated = 1
+																AND @MapEnrMemLet_status = 'A'
+																AND ISNULL(L.PBPNumber, '') = ISNULL(D.PBPNumber, '')
+																AND ISNULL(L.ContractNumber, '') = ISNULL(D.ContractNumber, '')
+																AND ISNULL(L.EffectiveDate, '') = ISNULL(D.EffectiveDate, '')
+																AND ISNULL(L.MemberorPOAAddressLine1, '') = ISNULL(D.MemberorPOAAddressLine1, '')
+																AND ISNULL(L.MemberorPOAAddressLine2, '') = ISNULL(D.MemberorPOAAddressLine2, '')
+																AND ISNULL(L.MemberorPOAAddressLine3, '') = ISNULL(D.MemberorPOAAddressLine3, '')
+																AND ISNULL(L.MemberorPOACity, '') = ISNULL(D.MemberorPOACity, '')
+																AND ISNULL(L.MemberorPOAState, '') = ISNULL(D.MemberorPOAState, '')
+																AND ISNULL(L.MemberorPOAZipCode, '') =   ISNULL(REPLACE(D.MemberorPOAZipCode, '-', ''), '')
+																AND ISNULL(L.ReasonCode, '') = ISNULL(D.ReasonCode, '')   ) 
+                                                begin
+													SET @SkipLetter = 1
+												end
+												 
+												---if there is a manual letter that was triggered for this app/template and thats not mailed yet.. we need to override..
+                                                IF EXISTS ( SELECT	TOP 1  1
+															FROM    Letter_data_outgoing_archive (nolock) L,
+																	#TmpLetterDaily D ( NOLOCK )
+															WHERE   @MapEnrMemLet_LetterTemplateID = @letterId
+																	AND D.Lettertemplateid = @MapEnrMemLet_LetterTemplateID
+																	AND D.Enroll_appid = @MapEnrMemLet_Enroll_AppID
+																	AND D.Enroll_MemberID = @MapEnrMemLet_Enroll_MemberID
+																	AND @MapEnrMemLet_LetterGenerated = 0
+																	AND @MapEnrMemLet_status = 'A')
+                                                               
+                                                begin
+													SET @SkipLetter = 0
+                                                end
+-- QC 19465/20391 - When an app is RFI'd again manually the parameter skipletterdelet is being set to 1 from the letter trigger . Just using that value to set the other parameter to 0.
+												if (@SkipLetterDelete = 1  )
+													set @SkipLetter = 0
+                                        END	
+                                END
+                        END
+                        
+                    IF @AppVarClient = 'wellcare' 
+						AND @EnrDetLetterRequestInformation_Full LIKE '%NEXPA%'
+						AND ISNULL(@EnrDetLetterRequestInformation, '') = ''
+							SET @SkipLetter = 1
+
+					---New Enrollment Letter Trigger
+                    IF @SkipLetter = 0 
+                        BEGIN
+                            DECLARE @existingLetterCount INT
+                            SET @existingLetterCount = 0
+
+							SELECT  @existingLetterCount = COUNT(*)
+							FROM    #TmpLetterDaily T ( NOLOCK )
+							WHERE   T.LetterTemplateId = @MapEnrMemLet_LetterTemplateID
+									AND @MapEnrMemLet_LetterTemplateID = @letterId
+									AND T.LetterTemplateId = @letterId
+									AND T.Enroll_appid = @MapEnrMemLet_Enroll_AppID
+									AND ISNULL(T.Enroll_MemberID, 0) = ISNULL(@MapEnrMemLet_Enroll_MemberID, 0)
+									AND @MapEnrMemLet_LetterGenerated = 0
+                                        
+                            IF ( @existingLetterCount > 0 )
+                                AND ( @SkipLetterDelete <> 1 ) 
+                                BEGIN
+                                    
+								   UPDATE	l
+									SET     ExistingLetters = @MapEnrMemLet_LetterID
+									FROM    Letter_Trgger_History_Log l WITH ( ROWLOCK ),
+											#TmpLetterDaily T ( NOLOCK )
+									WHERE   T.LetterTemplateId = @MapEnrMemLet_LetterTemplateID
+											AND @MapEnrMemLet_LetterTemplateID = @letterId
+											AND T.LetterTemplateId = @letterId
+											AND LetterTriggerHistoryID = @LetterHistId
+											AND ISNULL(T.Enroll_appid, 0) = ISNULL(@MapEnrMemLet_Enroll_AppID, 0)
+											AND ISNULL(T.Enroll_MemberID, 0) = ISNULL(@MapEnrMemLet_Enroll_MemberID, 0)
+											AND @MapEnrMemLet_LetterGenerated = 0
+                                    
+                                    UPDATE  M
+                                    SET     LetterGenerated = 0,
+                                            status = 'I',
+                                            modifiedBy = @CreatedBy,
+                                            modifiedDate = GETDATE()
+                                    FROM    MapEnrollMembertoLetters M with (rowlock),
+                                            #TmpLetterDaily T ( NOLOCK )
+                                    WHERE   M.LetterTemplateID = T.LetterTemplateId
+                                            AND M.LetterTemplateID = @letterId
+                                            AND T.LetterTemplateId = @letterId
+                                            AND M.Enroll_AppID = T.Enroll_appid
+                                            AND ISNULL(M.Enroll_MemberID, 0) = ISNULL(T.Enroll_MemberID, 0)
+                                            AND LetterGenerated = 0
+                                END
+                                    
+                            UPDATE  #TmpLetterDaily with (rowlock)
+                            SET     LetterCode = code
+                            FROM    dbo.Letter_Templates L ( NOLOCK )
+                            WHERE   L.LetterTemplateID = @letterId
+                            
+                            
+                            IF ( @pManualOverride = 1 ) 
+                                UPDATE  #TmpLetterDaily with (rowlock)
+                                SET     LetterGenerationMethodIndicator = 'M'
+                            ELSE 
+                                UPDATE  #TmpLetterDaily with (rowlock)
+                                SET     LetterGenerationMethodIndicator = 'S'
+									
+									
+                        					        
+                            IF @AppVarClient = 'WellCare' 
+                                    SET @deadlineDate = NULL		
+
+				     
+                            BEGIN TRY  
+                                BEGIN TRANSACTION  
+
+                                IF EXISTS ( SELECT TOP 1 1 FROM #TmpLetterDaily ( NOLOCK ) ) 
+                                    BEGIN
+                                        INSERT  INTO MapEnrollMembertoLetters with (rowlock)
+                                                (
+                                                  LetterTemplateID,
+                                                  Enroll_AppID,
+                                                  Enroll_MemberID,
+                                                  LetterGenerated,
+                                                  IsMailed,
+                                                  DueDate,
+                                                  CreatedDate,
+                                                  createdby,
+                                                  modifiedBy,
+                                                  ModifiedDate
+                                                )
+                                                SELECT  LetterTemplateId,
+                                                        Enroll_appid,
+                                                        Enroll_MemberID,
+                                                        0,
+                                                        0,
+                                                        CONVERT(VARCHAR, CAST(@deadlineDate AS DATETIME), 101),
+                                                        GETDATE(),
+                                                        @CreatedBy,
+                                                        @CreatedBy,
+                                                        GETDATE()
+                                                FROM    #TmpLetterDaily ( NOLOCK )
+                                                
+                                                  SET @pLetterId = SCOPE_IDENTITY()
+                                    END
+                              
+					
+					IF (@Client in( 'Freedom' ,'BCBSMI','Atlantis') OR (dbo.udf_CheckClause('PopulateOnlyMappedFieldsonMLE') = 1))
+					Begin 
+                                SELECT  @fields = CASE @fields
+                                                    WHEN '' THEN FieldName
+                                                    ELSE @fields + ', '
+                                                         + FieldName
+                                                  END
+                                FROM    ( SELECT DISTINCT
+                                                    LetterTemplateId,
+                                                    FieldName
+                                          FROM      Letter_Field_Mapping (nolock)
+                                          WHERE     FieldName NOT IN (
+                                                    'Enroll_appid',
+                                                    'Enroll_MemberID',
+                                                    'lettertemplateid',
+                                                    'LetterCode',
+                                                    'IKALetterRequestID',
+                                                    'MemberID', 'PlanType' )
+                                        ) x
+                                WHERE   LetterTemplateId = ( SELECT [LetterTemplateID]
+                                                             FROM   [dbo].[MapEnrollMembertoLetters] t (nolock)
+                                                             WHERE  [LetterID] = @pLetterId
+                                                           )
+								
+                                SET @sqlLetter = ' INSERT  INTO Letter_data_outgoing_daily with (rowlock)
+                                    (
+                                      Enroll_appid,
+                                      Enroll_MemberID,
+                                      lettertemplateid,
+                                      MemberID,PlanType,
+                                      LetterCode,
+                                      IKALetterRequestID,' + @fields + ' )
+                                    SELECT  Enroll_appid,
+                                            Enroll_MemberID,
+                                            lettertemplateid,
+                                            MemberID,PlanType,
+                                            LetterCode,'
+                                    + CAST(@pLetterId AS VARCHAR) + ', '
+                                    + @fields + ' FROM    #TmpLetterDaily'
+                                            
+                                PRINT @sqlLetter
+                                EXEC ( @sqlLetter )
+                                    
+                                    
+                                    END
+            
+					IF (dbo.udf_CheckClause('PopulateOnlyMappedFieldsonMLE') = 0)
+					begin 
+					
+					    INSERT  INTO Letter_data_outgoing_daily with (rowlock)
+                                    (
+                                      Enroll_appid,
+                                      Enroll_MemberID,
+                                      lettertemplateid,
+                                      LetterCode,
+                                      IKALetterRequestID,
+                                      PBPNumber,
+                                      ContractNumber,
+                                      FileCreationDate,
+                                      MemberFirstName,
+                                      MemberMiddleInitial,
+                                      MemberLastName,
+                                      Salutation,
+                                      MemberID,
+                                      MemberorPOAAddressLine1,
+                                      MemberorPOAAddressLine2,
+                                      MemberorPOAAddressLine3,
+                                      MemberorPOACity,
+                                      MemberorPOAState,
+                                      MemberorPOAZipCode,
+                                      HICN,
+                                      RxGroup,
+                                      RxBin,
+                                      RxPCN,
+                                      RxID,
+                                      PlanName,
+                                      PlanType,
+                                      PlanStartDate,
+                                      PlanEndDate,
+                                      NewPlanName,
+                                      NewContractNumber,
+                                      NewPBPNumber,
+                                      NewPlanStartDate,
+                                      NewPlanEndDate,
+                                      EffectiveDate,
+                                      DisenrollmentEffectiveDate,
+                                      LastDateofCoverage,
+                                      PremiumAmount,
+                                      NewPremiumAmount,
+                                      LISIndicator,
+                                      LISLevel,
+                                      LISSubsidyLevel,
+                                      LISMonthlyPremium,
+                                      LISDeductibleAmount,
+                                      LISCoPayAmount,
+                                      LEPIndicator,
+                                      LEPAmount,
+                                      NoofUncoveredMonths,
+                                      RequestedDate,
+                                      DeadlineDate,
+                                      ReasonCode,
+                                      PreviousEnrollmentIndicator,
+                                      FirstMonthofNewIEP,
+                                      LastMonthofNewIEP,
+                                      CreditableCoverageGapStartDate,
+                                      CreditableCoverageGapEndDate,
+                                      RetroactiveLEPPaymentIndicator,
+                                      RetroactiveLumpSum,
+                                      RetroactiveLEPAmountOwed,
+                                      RefundMethodIndicator,
+                                      LEPRefundAmount,
+                                      PremiumPaymentMethodIndicator,
+                                      ErrorReason,
+                                      LEPAmountChangeIndicator,
+                                      EmployerGroupIndicator,
+                                      EmployerUnionSPAPName,
+                                      EffectiveDateofLISEligibility,
+                                      State,
+                                      County,
+                                      RegionCode,
+                                      GroupNumber,
+                                      Miscellaneous,
+                                      [CatastrophicCoverageCoPay_Generic_Preferred],
+                                      [CatastrophicCoverageCoPay_AllOtherDrugs],
+                                      MemberStatus,
+                                      AttestationType,
+                                      DateAttestationReturned,
+                                      LISDrugCoPay_AllOtherDrugs,
+                                      LISDrugCoPay_GenericPreferred,
+                                      EndDateDeemedContinuedEligibility,
+                                      PeriodLengthDeemedContinuedEligibility,
+                                      ExpirationDateofDeemedContEligSEPPeriod,
+									  [Language] ,
+									  TRC ,
+									  PCPID ,
+									  LetterGenerationMethodIndicator ,
+									  LowIncomeSubsidySourceIndicator ,
+									  FavorableIndicator ,
+									  EntitlementIndicator ,
+									  PremiumDueDate ,
+									  PastDueBalance ,
+									  EndDateofLISEligibility ,
+									  AttestationReturneeIndicator ,
+									  LEPNoticeIndicator ,
+									  LateCreditableInfoIndicator ,
+									  SubGroup,
+									   --GAT_900201
+										LetterGenerationDate,
+										CostSharingIndicator,
+										ShipName,
+										ShipNumber,
+									  --END of GAT_900201
+									  AltFormat
+                                    )
+                                    SELECT  Enroll_appid,
+                                            Enroll_MemberID,
+                                            lettertemplateid,
+                                            LetterCode,
+                                            @pLetterId,
+                                            [PBPNumber],
+                                            [ContractNumber],
+                                            [FileCreationDate],
+                                            [MemberFirstName],
+                                            [MemberMiddleInitial],
+                                            [MemberLastName],
+                                            [Salutation],
+                                            MemberID,
+                                            [MemberorPOAAddressLine1],
+                                            [MemberorPOAAddressLine2],
+                                            [MemberorPOAAddressLine3],
+                                            [MemberorPOACity],
+                                            [MemberorPOAState],
+                                            [MemberorPOAZipCode],
+                                            [HICN],
+                                            [RxGroup],
+                                            [RxBin],
+                                            [RxPCN],
+                                            RxID,
+                                            [PlanName],
+                                            [PlanType],
+                                            [PlanStartDate],
+                                            [PlanEndDate],
+                                            [NewPlanName],
+                                            [NewContractNumber],
+                                            [NewPBPNumber],
+                                            [NewPlanStartDate],
+                                            NewPlanEndDate,
+                                            [EffectiveDate],
+                                            [DisenrollmentEffectiveDate],
+                                            [LastDateofCoverage],
+                                            [PremiumAmount],
+                                            [NewPremiumAmount],
+                                            [LISIndicator],
+                                            [LISLevel],
+                                            [LISSubsidyLevel],
+                                            [LISMonthlyPremium],
+                                            [LISDeductibleAmount],
+                                            [LISCoPayAmount],
+                                            [LEPIndicator],
+                                            [LEPAmount],
+                                            [NoofUncoveredMonths],
+                                            [RequestedDate],
+                                            [DeadlineDate],
+                                            [ReasonCode],
+                                            [PreviousEnrollmentIndicator],
+                                            [FirstMonthofNewIEP],
+                                            [LastMonthofNewIEP],
+                                            [CreditableCoverageGapStartDate],
+                                            [CreditableCoverageGapEndDate],
+                                            [RetroactiveLEPPaymentIndicator],
+                                            [RetroactiveLumpSum],
+                                            [RetroactiveLEPAmountOwed],
+                                            [RefundMethodIndicator],
+                                            LEPRefundAmount,
+                                            [PremiumPaymentMethodIndicator],
+                                            [ErrorReason],
+                                            LEPAmountChangeIndicator,
+                                            [EmployerGroupIndicator],
+                                            [EmployerUnionSPAPName],
+                                            [EffectiveDateofLISEligibility],
+                                            [State],
+                                            [County],
+                                            [RegionCode],
+                                            [GroupNumber],
+                                            [Miscellaneous],
+                                            [CatastrophicCoverageCoPay_Generic_Preferred],
+                                            [CatastrophicCoverageCoPay_AllOtherDrugs],
+                                            [MemberStatus],
+                                            AttestationType,
+                                            [DateAttestationReturned],
+                                            LISDrugCoPay_AllOtherDrugs,
+                                            LISDrugCoPay_GenericPreferred,
+                                            EndDateDeemedContinuedEligibility,
+                                            PeriodLengthDeemedContinuedEligibility,
+                                            ExpirationDateofDeemedContEligSEPPeriod,
+                                            [Language] ,
+										    TRC ,
+										    PCPID ,
+										    LetterGenerationMethodIndicator ,
+										    LowIncomeSubsidySourceIndicator ,
+										    FavorableIndicator ,
+										    EntitlementIndicator ,
+										    PremiumDueDate ,
+										    PastDueBalance ,
+										    EndDateofLISEligibility ,
+										    AttestationReturneeIndicator ,
+										    LEPNoticeIndicator ,
+										    LateCreditableInfoIndicator ,
+										    SubGroup ,
+										     --GAT_900201
+											LetterGenerationDate,
+											CostSharingIndicator,
+											ShipName,
+											ShipNumber,
+											--END of GAT_900201
+											AltFormat
+                                    FROM    #TmpLetterDaily ( NOLOCK )
+					end
+					
+                                COMMIT TRANSACTION  
+                            END TRY  
+                            BEGIN CATCH     
+      
+                                SET @LetterErrors = ISNULL(@LetterErrors, '')
+                                    + 'Error in inserting in the letter tables : Error Message - rollback transaction'
+                                    + ERROR_MESSAGE()
+                                UPDATE  Letter_Trgger_History_Log WITH ( ROWLOCK )
+                                SET     ProcessLog = @LetterErrors
+                                WHERE   LetterTriggerHistoryID = @LetterHistId 
+                           
+                                ROLLBACK TRANSACTION  
+                            END CATCH  
+               
+               
+                 	--GAT_900352_Q3 Release
+                 	--QC16500
+               /*	IF EXISTS ( SELECT  1
+                                FROM    Application_Variables (NOLOCK)
+                                WHERE   VariableName = 'HealthPlanName'
+                                        AND VariableValue in ( 'UPMC' ,'MedStar','MedImpact' ) )
+                       */
+                   IF ( dbo.udf_CheckClause('UPMCTPAClients') =1  or @Client in ('MedImpact'))                 
+                        BEGIN
+						
+						   UPDATE  Letter_data_outgoing_Daily with (rowlock)
+						   SET   
+						   MemberFirstName = UPPER(MemberFirstName),
+						   MemberMiddleInitial = UPPER(MemberMiddleInitial),
+						   MemberLastName =UPPER( MemberLastName),
+								[Salutation] = UPPER([Salutation]),
+							  [MemberorPOAAddressLine1] =  UPPER([MemberorPOAAddressLine1]),
+							  [MemberorPOAAddressLine2] = UPPER([MemberorPOAAddressLine2]),
+							  [MemberorPOAAddressLine3] =  UPPER([MemberorPOAAddressLine3]),
+							  [MemberorPOACity] =  UPPER([MemberorPOACity]),
+							  [MemberorPOAState] =  UPPER([MemberorPOAState])
+						END
+		--END of GAT_900352_Q3 Release
+                              
+                          ----update the ikacorrespondencecode with Plantype so that we get the code as code+pDP for PDP plans only
+                            UPDATE  d
+                            SET     D.LetterCode = D.lettercode + PlanType
+                            FROM    Letter_data_outgoing_Daily D with (rowlock) ,
+                                    Letter_master M (nolock),
+                                    Letter_Templates (nolock) L
+                            WHERE   M.LetterMasterID = L.LetterMasterId
+                                    AND L.LetterTemplateID = D.LetterTemplateId
+                                    AND D.PlanType = 'PDP'
+                                    AND M.IkaCorrespondenceFlag = '1'
+                                    AND D.IKALetterRequestID = @pLetterId
+                        END
+					 --GAT_900201
+							UPDATE  Letter_data_outgoing_Daily with (rowlock)
+							SET    	LetterGenerationDate = REPLACE(CONVERT(VARCHAR, GETDATE(), 112),'/', '')
+							WHERE   IKALetterRequestID = @pLetterId and isnull(LetterGenerationDate,'') = ''
+				  --END of GAT_900201
+                        
+                    UPDATE  m
+                    SET     [ContractNumber] = @pContractNumber,
+                            [PBP] = @pPBP,
+                            [EffectiveDate] = @pEffectiveDate,
+                            [GroupNumber] = @pGroupNumber,
+                            m.[LetterCode] = tem.[Code],
+                            m.[LetterType] = mas.[LetterType]
+                    FROM    MapEnrollMembertoLetters m with (rowlock),
+                            [dbo].[Letter_Templates] tem ( NOLOCK ),
+                            letter_master mas ( NOLOCK )
+                    WHERE   [LetterID] = @pLetterId
+                            AND m.[LetterTemplateID] = tem.[LetterTemplateID]
+                            AND mas.[LetterMasterID] = tem.[LetterMasterId]
+                            
+                    IF @AppVarClient = 'BCBSMI'
+                        BEGIN
+                                                    
+                            UPDATE  m
+                            SET     DueDate = CONVERT(VARCHAR, CAST(DATEADD(dd, 2, @deadlineDate) AS DATETIME), 101)
+                            FROM    MapEnrollMembertoLetters m with (rowlock),
+                                    [dbo].[Letter_Templates] tem ( NOLOCK ),
+                                    letter_master mas ( NOLOCK )
+                            WHERE   [LetterID] = @pLetterId
+                                    AND m.[LetterTemplateID] = tem.[LetterTemplateID]
+                                    AND mas.[LetterMasterID] = tem.[LetterMasterId]
+                                    AND m.LetterTemplateID  IN (SELECT DISTINCT LetterTemplateID FROM #TmpLetterTemplates (NOLOCK))
+                                                    
+                        END
+                                
+                    UPDATE  Letter_Trgger_History_Log WITH ( ROWLOCK )
+                    SET     OutputLetterId = @pLetterId /*, SelectedTemplateId = ''*/
+                    WHERE   LetterTriggerHistoryID = @LetterHistId 
+					      
+                                    
+					UPDATE  L
+                    SET     L.DeadlineDate = CONVERT(VARCHAR, CAST(@MapEnrMemLet_DueDate AS DATETIME), 112)
+                    FROM    Letter_data_outgoing_Daily L with (rowlock)
+                    WHERE   L.IKALetterRequestID = @MapEnrMemLet_LetterID
+                            AND @MapEnrMemLet_LetterID = @pLetterId
+                            AND L.IKALetterRequestID = @pLetterId
+                            AND @MapEnrMemLet_LetterTemplateID IN (
+											SELECT DISTINCT LetterTemplateID FROM #TmpLetterTemplates (NOLOCK))
+											
+				--COGLO-487 Manual letter NM02 is oging to bring Deadline in blank
+					Declare @TemplateIDRec2 int
+					select @TemplateIDRec2 = LetterTemplateID from Letter_templates where Code='NM02'
+					
+					update Letter_data_outgoing_Daily
+					Set DeadlineDate=''
+					where LetterTemplateId=@TemplateIDRec2
+				--End COGLO-487
+											
+	             --2015 Chpt 2 TRC 015 Logic Suspension CRD-5108
+
+                  IF ( dbo.udf_CheckClause('TRC015LetterSuppress') = 1 ) 
+                    BEGIN	
+                        UPDATE  L
+                        SET     L.LetterApprovalRequired = LD.LetterApprovalRequired
+                        FROM    letter_master (NOLOCK) LM
+                                INNER JOIN Letter_Templates (NOLOCK) LT ON LT.LetterMasterID = LM.LetterMasterID
+                                INNER JOIN Letter_Template_Configuration_Detail (NOLOCK) LD ON LD.LetterTemplateID = LT.LetterTemplateID
+                                INNER JOIN MapEnrollMembertoLetters L WITH ( ROWLOCK ) ON L.LetterTemplateID = Lt.LetterTemplateID
+                        WHERE   l.LetterID = @pLetterId
+                    END 
+	             										 
+									
+                END  ---End of While Loop    
+			   
+            END
+            
+----No letters found for the member      
+        IF @availabeLetters = '' 
+            PRINT 'No Available letters'      
+         --Running the MLE validation on each letter.               
+        BEGIN TRY      
+            DECLARE @p_newLetterId INT   
+
+            BEGIN TRY
+                SET @p_newLetterId = CAST(@pLetterID AS INT) 
+            END TRY
+            BEGIN CATCH
+                SET @p_newLetterId = -1600 ;
+            END CATCH
+              
+            SET @p_newLetterId = ISNULL(NULLIF(@p_newLetterid, ''), -1500)
+            IF @p_newLetterId > 0 
+                EXEC usp_RealTimeMLEValidation @p_newLetterId --Real Time MLE Validation Process
+            ELSE 
+                BEGIN
+                    SET @LetterErrors = ISNULL(@LetterErrors, '')
+                        + 'No Available Letterid to validate MLE  : Error Message - '
+                        + ERROR_MESSAGE()    
+                    UPDATE  Letter_Trgger_History_Log WITH ( ROWLOCK )
+                    SET     ProcessLog = @LetterErrors
+                    WHERE   LetterTriggerHistoryID = @LetterHistId    
+                    RETURN ;
+                END
+        END TRY      
+        BEGIN CATCH      
+                      
+            SET @LetterErrors = ISNULL(@LetterErrors, '')
+                + 'Error during MLE validation  : Error Message - '
+                + ERROR_MESSAGE()      
+            UPDATE  Letter_Trgger_History_Log WITH ( ROWLOCK )
+            SET     ProcessLog = @LetterErrors
+            WHERE   LetterTriggerHistoryID = @LetterHistId       
+            RETURN ;      
+        END CATCH      
+
+        EXEC usp_InsertAuditLog 'MapEnrollMembertoLetters', 1, @LogUID, @pUserId,
+            @pMemberID, @pAppID, @pLetterId, 0, 0
+                      
+        
+END 
+    
+	
+
+
